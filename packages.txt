@@ -1,3 +1,2 @@
 ffmpeg
-fonts-noto
-fonts-noto-arabic
+fonts-noto-core
