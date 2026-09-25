@@ -3,36 +3,52 @@ import subprocess
 import asyncio
 import tempfile
 import streamlit as st
+from groq import Groq
 import edge_tts
 from gtts import gTTS
 from gradio_client import Client, handle_file
 
 st.set_page_config(
-    page_title="Urdu Lip-Sync Dubber",
+    page_title="AI Video Urdu Dubber & Lip-Sync",
     page_icon="🎬",
     layout="wide"
 )
 
 st.title("🎬 AI Video Urdu Dubber & Lip-Sync Studio")
-st.caption("ویڈیو کے چہرے کے ہونٹوں کو اپنے اردو اسکرپٹ کے مطابق سنک (Lip-Sync) کریں")
+st.caption("Dub videos into Urdu with custom script input or LLM translation, perfectly timed with AI Lip-Sync")
 
-# 1. Sidebar Configuration
+# 1. API Configuration
+api_key = st.secrets.get("GROQ_API_KEY", "")
+if not api_key:
+    api_key = st.sidebar.text_input("Groq API Key (Required only if auto-translating)", type="password")
+
+client = Groq(api_key=api_key) if api_key else None
+
+# 2. Sidebar Configuration
 with st.sidebar:
-    st.header("⚙️ سیٹنگز (Settings)")
+    st.header("Settings")
     voice_selection = st.selectbox(
-        "اردو آواز کا انتخاب کریں (Urdu Voice)",
-        options=["Asad (مردانہ آواز - پاکستانی)", "Uzma (زنانی آواز - پاکستانی)"],
+        "Select Urdu Voice",
+        options=["Asad (Male - Pakistani)", "Uzma (Female - Pakistani)"],
         index=0
     )
     voice_id = "ur-PK-AsadNeural" if "Asad" in voice_selection else "ur-PK-UzmaNeural"
 
-    st.markdown("---")
-    st.markdown("**طریقہ کار:**")
-    st.markdown("1. ویڈیو اپ لوڈ کریں۔")
-    st.markdown("2. اپنا اردو ڈائیلاگ / اسکرپٹ درج کریں۔")
-    st.markdown("3. بٹن دبائیں اور Lip-Synced ویڈیو حاصل کریں۔")
+    source_language = st.selectbox(
+        "Original Video Language (if using auto-translate)",
+        options=["Auto-Detect", "Arabic", "Turkish", "Persian", "English"],
+        index=0
+    )
+    lang_code_map = {"Auto-Detect": None, "Arabic": "ar", "Turkish": "tr", "Persian": "fa", "English": "en"}
+    selected_lang_code = lang_code_map[source_language]
 
-# 2. Helper Functions
+    st.markdown("---")
+    st.markdown("**Instructions:**")
+    st.markdown("1. Upload a video file.")
+    st.markdown("2. Enter your own Urdu script (or leave empty for AI auto-translation).")
+    st.markdown("3. Click Start to generate the Lip-Synced Urdu video.")
+
+# 3. Helper Functions
 def get_media_duration(file_path: str) -> float:
     """Calculates exact duration of media in seconds."""
     cmd = [
@@ -49,9 +65,9 @@ async def generate_urdu_tts_robust(text: str, voice: str, output_path: str):
     """Generates natural Urdu voiceover with bulletproof fallback."""
     clean_text = text.strip()
     if not clean_text:
-        clean_text = "کوئی اسکرپٹ درج نہیں کیا گیا"
+        clean_text = "No script provided."
 
-    # Attempt 1: Edge-TTS Neural Voice
+    # Attempt 1: Microsoft Neural Voice
     try:
         communicate = edge_tts.Communicate(text=clean_text, voice=voice)
         await communicate.save(output_path)
@@ -65,7 +81,7 @@ async def generate_urdu_tts_robust(text: str, voice: str, output_path: str):
         tts = gTTS(text=clean_text, lang="ur")
         tts.save(output_path)
     except Exception as e:
-        raise RuntimeError(f"آواز بنانے میں خرابی: {str(e)}")
+        raise RuntimeError(f"Urdu voice synthesis error: {str(e)}")
 
 def adjust_audio_tempo_and_pad(input_audio: str, target_duration: float, output_audio: str):
     """Adjusts tempo and pads/trims audio to exactly match the video duration."""
@@ -75,7 +91,6 @@ def adjust_audio_tempo_and_pad(input_audio: str, target_duration: float, output_
         return
 
     tempo = curr_duration / target_duration
-    # Clamp tempo between 0.75x and 1.35x for realistic speech cadence
     clamped_tempo = max(0.75, min(1.35, tempo))
 
     cmd = [
@@ -89,7 +104,7 @@ def adjust_audio_tempo_and_pad(input_audio: str, target_duration: float, output_
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def run_wav2lip_robust(video_path: str, audio_path: str) -> str:
-    """Executes AI Lip-Sync on cloud GPU spaces."""
+    """Executes AI Lip-Sync on active public GPU spaces."""
     public_spaces = [
         "camenduru/Wav2Lip",
         "prasannas/Wav2Lip",
@@ -121,25 +136,41 @@ def run_wav2lip_robust(video_path: str, audio_path: str) -> str:
             continue
     return None
 
-# 3. Main Interface
-uploaded_file = st.file_uploader("1️⃣ ویڈیو اپ لوڈ کریں (MP4, MKV, MOV)", type=["mp4", "mkv", "mov"])
+def translate_with_llm(groq_client: Groq, text: str) -> str:
+    """Translates spoken speech into natural spoken Urdu using Groq LLM."""
+    system_prompt = (
+        "You are an expert dubbing translator. Translate the given spoken speech "
+        "into clear, natural, spoken Pakistani Urdu dialogue for video voiceover dubbing. "
+        "Output ONLY the Urdu translation script in Urdu alphabet without any English or notes."
+    )
+    # Line 127: LLM MODEL INVOCATION
+    response = groq_client.chat.completions.create(
+        model="mixtral-8x7b-32768",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text}
+        ],
+        max_tokens=4096,
+        temperature=0.2
+    )
+    return response.choices[0].message.content.strip()
+
+# 4. Main Application Interface
+uploaded_file = st.file_uploader("1. Upload Video File (MP4, MKV, MOV)", type=["mp4", "mkv", "mov"])
 
 user_script = st.text_area(
-    "2️⃣ اپنا اردو اسکرپٹ یہاں لکھیں (جو ویڈیو میں بولنا ہے):",
-    placeholder="مثال: السلام علیکم! حدیث شریف کے اس مقابلے میں آپ کا خیر مقدم ہے۔۔۔",
+    "2. Enter Your Urdu Script (Optional - If provided, AI will directly dub this script):",
+    placeholder="Enter the exact Urdu dialogue here. If left empty, AI will transcribe and translate automatically...",
     height=150
 )
 
 if uploaded_file is not None:
     st.video(uploaded_file)
 
-    if st.button("🚀 اردو Lip-Sync ڈبنگ تیار کریں", type="primary"):
-        if not user_script.strip():
-            st.warning("⚠️ برائے مہربانی پہلے اوپر والے باکس میں اپنا اردو اسکرپٹ درج کریں۔")
-            st.stop()
-
+    if st.button("🚀 Start Urdu Dubbing & Lip-Sync", type="primary"):
         with tempfile.TemporaryDirectory() as temp_dir:
             input_video_path = os.path.join(temp_dir, "input.mp4")
+            extracted_audio_path = os.path.join(temp_dir, "extracted.mp3")
             raw_urdu_audio_path = os.path.join(temp_dir, "urdu_raw.mp3")
             synced_urdu_audio_path = os.path.join(temp_dir, "urdu_synced.mp3")
             final_output_path = os.path.join(temp_dir, "final_dubbed.mp4")
@@ -148,33 +179,65 @@ if uploaded_file is not None:
                 f.write(uploaded_file.getbuffer())
 
             video_duration = get_media_duration(input_video_path)
-            
             progress = st.progress(0)
             status = st.empty()
 
             try:
-                # Step 1: Synthesize Urdu Voice from User Script
-                status.info("1/3: آپ کے لکھے ہوئے اسکرپٹ کی اردو آواز تیار کی جا رہی ہے...")
-                progress.progress(30)
-                asyncio.run(generate_urdu_tts_robust(user_script.strip(), voice_id, raw_urdu_audio_path))
+                # Determine Urdu Script: Custom input OR LLM translation
+                if user_script.strip():
+                    status.info("Using your custom Urdu script...")
+                    progress.progress(30)
+                    urdu_text = user_script.strip()
+                else:
+                    if not client:
+                        st.error("Please enter a Groq API Key in the sidebar or provide a custom Urdu script above.")
+                        st.stop()
 
-                # Step 2: Time Alignment & Synchronization
-                status.info(f"2/3: آواز کی ٹائمنگ کو ویڈیو کی لمبائی ({int(video_duration)} سیکنڈ) کے مطابق ڈھالا جا رہا ہے...")
-                progress.progress(60)
+                    status.info("Extracting original audio from video...")
+                    progress.progress(15)
+                    subprocess.run([
+                        "ffmpeg", "-y", "-i", input_video_path,
+                        "-vn", "-acodec", "libmp3lame", "-ar", "16000", extracted_audio_path
+                    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                    status.info("Transcribing speech with Whisper...")
+                    progress.progress(25)
+                    whisper_args = {
+                        "file": (os.path.basename(extracted_audio_path), open(extracted_audio_path, "rb").read()),
+                        "model": "whisper-large-v3",
+                        "response_format": "text"
+                    }
+                    if selected_lang_code:
+                        whisper_args["language"] = selected_lang_code
+
+                    transcription = client.audio.transcriptions.create(**whisper_args)
+                    original_speech = str(transcription).strip()
+
+                    status.info("Translating dialogue into Urdu using LLM...")
+                    progress.progress(35)
+                    urdu_text = translate_with_llm(client, original_speech)
+
+                # Step 1: Synthesize Urdu Voice
+                status.info("Synthesizing Urdu voiceover...")
+                progress.progress(50)
+                asyncio.run(generate_urdu_tts_robust(urdu_text, voice_id, raw_urdu_audio_path))
+
+                # Step 2: Time Alignment (Match original video duration)
+                status.info(f"Aligning audio duration to match video ({int(video_duration)} seconds)...")
+                progress.progress(70)
                 adjust_audio_tempo_and_pad(raw_urdu_audio_path, video_duration, synced_urdu_audio_path)
 
                 # Step 3: AI Lip-Sync Execution
-                status.info("3/3: چہرے کے ہونٹوں کی حرکت کو اردو بول کے مطابق سنک (Lip-Sync) کیا جا رہا ہے...")
-                progress.progress(80)
-
+                status.info("Processing AI Lip-Sync (Synchronizing actor lips with Urdu speech)...")
+                progress.progress(85)
                 lip_sync_video = run_wav2lip_robust(input_video_path, synced_urdu_audio_path)
-                
+
                 if lip_sync_video and os.path.exists(lip_sync_video):
                     final_output_path = lip_sync_video
                     progress.progress(100)
-                    status.success("🎉 مبارک ہو! ویڈیو کا Lip-Sync کامیابی سے مکمل ہو گیا۔")
+                    status.success("Success! AI Lip-Sync completed successfully.")
                 else:
-                    st.warning("⚠️ کلاؤڈ GPU سرور پر رش کی وجہ سے ڈائریکٹ آڈیو سنک ویڈیو رینڈر کی جا رہی ہے۔")
+                    status.warning("Notice: Cloud Lip-Sync was busy. Generated standard high-precision audio dubbing.")
                     cmd_merge = [
                         "ffmpeg", "-y", "-i", input_video_path, "-i", synced_urdu_audio_path,
                         "-c:v", "copy", "-c:a", "aac",
@@ -183,20 +246,19 @@ if uploaded_file is not None:
                     ]
                     subprocess.run(cmd_merge, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     progress.progress(100)
-                    status.success("🎉 ویڈیو اردو آواز کے ساتھ مکمل تیار ہے!")
 
-                # Final Video Output Display
-                st.subheader(f"🎬 حتمی ویڈیو (طوالت: {int(video_duration)} سیکنڈ)")
+                # Final Results
+                st.subheader(f"🎬 Dubbed Video Output ({int(video_duration)} seconds)")
                 st.video(final_output_path)
 
                 with open(final_output_path, "rb") as out_file:
                     st.download_button(
-                        label="⬇️ Lip-Synced ویڈیو ڈاؤنلوڈ کریں",
+                        label="⬇️ Download Dubbed Video",
                         data=out_file.read(),
-                        file_name="urdu_lipsynced_video.mp4",
+                        file_name="urdu_dubbed_video.mp4",
                         mime="video/mp4",
                         type="primary"
                     )
 
             except Exception as e:
-                st.error(f"پروسیسنگ کے دوران خرابی پیش آئی: {str(e)}")
+                st.error(f"Processing error: {str(e)}")
