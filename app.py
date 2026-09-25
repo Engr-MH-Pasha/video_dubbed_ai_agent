@@ -14,7 +14,7 @@ st.set_page_config(
 )
 
 st.title("🎬 AI Video to Urdu Dubber & Lip-Sync Studio")
-st.caption("Convert English videos into synchronized Urdu speech with optional AI Lip-Sync")
+st.caption("Convert English, Arabic, Turkish, and Persian videos into synchronized Urdu speech with optional Lip-Sync")
 
 # 1. API Key Configuration
 api_key = st.secrets.get("GROQ_API_KEY", "")
@@ -29,14 +29,32 @@ client = Groq(api_key=api_key)
 
 # 2. Sidebar Configuration
 with st.sidebar:
-    st.header("Settings")
+    st.header("⚙️ Configuration")
+    
+    # Language Selection for Input Video
+    language_mapping = {
+        "Auto-Detect (خودکار شناخت)": None,
+        "English (انگریزی)": "en",
+        "Arabic (عربی)": "ar",
+        "Turkish (ترکی)": "tr",
+        "Persian / Farsi (فارسی)": "fa"
+    }
+    selected_lang_label = st.selectbox(
+        "Select Video Language (ویڈیو کی زبان)",
+        options=list(language_mapping.keys()),
+        index=0
+    )
+    source_language_code = language_mapping[selected_lang_label]
+
+    # Voice Selection
     voice_selection = st.selectbox(
-        "Select Urdu Voice",
+        "Select Urdu Voice (اردو آواز)",
         options=["Asad (Male - Pakistani)", "Uzma (Female - Pakistani)"],
         index=0
     )
     voice_id = "ur-PK-AsadNeural" if "Asad" in voice_selection else "ur-PK-UzmaNeural"
 
+    # Lip-Sync Option
     enable_lipsync = st.checkbox(
         "Enable AI Lip-Sync (Beta)",
         value=False,
@@ -44,10 +62,8 @@ with st.sidebar:
     )
     
     st.markdown("---")
-    st.markdown("**Instructions:**")
-    st.markdown("1. Upload a short video clip (15-60 seconds recommended).")
-    st.markdown("2. Click Start Dubbing.")
-    st.markdown("3. Download your completed Urdu-dubbed MP4.")
+    st.markdown("**Supported Input Languages:**")
+    st.markdown("- English (انگریزی)\n- Arabic (عربی)\n- Turkish (ترکی)\n- Persian (فارسی)")
 
 # 3. Helper Functions
 def get_media_duration(file_path: str) -> float:
@@ -75,7 +91,6 @@ def adjust_audio_tempo(input_audio: str, target_duration: float, output_audio: s
         return
 
     tempo = curr_duration / target_duration
-    # Clamp tempo between 0.75x and 1.35x for clear, natural speech
     tempo = max(0.75, min(1.35, tempo))
     
     cmd = [
@@ -126,35 +141,41 @@ if uploaded_file is not None:
                     "-vn", "-acodec", "libmp3lame", "-ar", "16000", extracted_audio_path
                 ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-                # Step 2: Speech-to-Text via Groq Whisper
-                status.info("Step 2/5: Transcribing English speech with Whisper...")
+                # Step 2: Speech-to-Text via Groq Whisper with selected language
+                status.info("Step 2/5: Transcribing original speech...")
                 progress.progress(35)
-                with open(extracted_audio_path, "rb") as audio_file:
-                    transcription = client.audio.transcriptions.create(
-                        file=(os.path.basename(extracted_audio_path), audio_file.read()),
-                        model="whisper-large-v3-turbo",
-                        response_format="text"
-                    )
                 
-                english_text = str(transcription).strip()
-                if not english_text:
+                whisper_kwargs = {
+                    "file": (os.path.basename(extracted_audio_path), open(extracted_audio_path, "rb").read()),
+                    "model": "whisper-large-v3-turbo",
+                    "response_format": "text"
+                }
+                if source_language_code:
+                    whisper_kwargs["language"] = source_language_code
+
+                transcription = client.audio.transcriptions.create(**whisper_kwargs)
+                original_text = str(transcription).strip()
+                
+                if not original_text:
                     st.error("No clear voice or speech detected in the uploaded video.")
                     st.stop()
 
-                # Step 3: Translation via Groq Llama 3.3
+                # Step 3: Translation into Natural Spoken Urdu via Llama 3.3
                 status.info("Step 3/5: Translating dialogue into natural Urdu...")
                 progress.progress(55)
+                
+                lang_name = selected_lang_label.split(" (")[0]
                 system_prompt = (
-                    "You are an expert dubbing translator. Translate the provided English speech "
+                    f"You are an expert dubbing translator. Translate the provided {lang_name} speech "
                     "into natural, conversational spoken Pakistani Urdu suitable for audio voiceover. "
-                    "Keep the length concise to match original speech cadence. "
-                    "Output ONLY the Urdu translation script in Urdu alphabet without any English text or explanations."
+                    "Keep the length concise so the Urdu dubbing duration naturally matches the original cadence. "
+                    "Output ONLY the Urdu translation script in Urdu alphabet without any explanations, Latin script, or additional notes."
                 )
                 translation = client.chat.completions.create(
                     model="llama-3.3-70b-versatile",
                     messages=[
                         {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": english_text}
+                        {"role": "user", "content": original_text}
                     ],
                     temperature=0.3
                 )
@@ -165,11 +186,10 @@ if uploaded_file is not None:
                 progress.progress(75)
                 asyncio.run(generate_urdu_tts(urdu_text, voice_id, raw_urdu_audio_path))
                 
-                # Match Urdu audio duration with the original video length
                 adjust_audio_tempo(raw_urdu_audio_path, video_duration, synced_urdu_audio_path)
 
                 # Step 5: Multiplexing / Lip-Sync
-                status.info("Step 5/5: Multiplexing final video...")
+                status.info("Step 5/5: Rendering final video...")
                 progress.progress(90)
 
                 lip_sync_success = False
@@ -184,7 +204,6 @@ if uploaded_file is not None:
                         st.warning(f"Cloud Lip-Sync server was busy. Falling back to standard audio dubbing. ({err})")
 
                 if not lip_sync_success:
-                    # Standard audio replacement with strict duration cut
                     subprocess.run([
                         "ffmpeg", "-y", "-i", input_video_path, "-i", synced_urdu_audio_path,
                         "-c:v", "copy", "-map", "0:v:0", "-map", "1:a:0",
@@ -197,8 +216,8 @@ if uploaded_file is not None:
                 # Display Results
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.markdown("**Original English Transcript:**")
-                    st.info(english_text)
+                    st.markdown("**Original Transcript:**")
+                    st.info(original_text)
                 with col2:
                     st.markdown("**Urdu Dubbing Script:**")
                     st.success(urdu_text)
