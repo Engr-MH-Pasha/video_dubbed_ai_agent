@@ -1,4 +1,5 @@
 streamlit
 groq
 edge-tts
+gtts
 gradio-client
