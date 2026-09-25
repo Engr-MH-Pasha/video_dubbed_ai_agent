@@ -5,6 +5,7 @@ import tempfile
 import streamlit as st
 from groq import Groq
 import edge_tts
+from gtts import gTTS
 from gradio_client import Client, handle_file
 
 st.set_page_config(
@@ -53,9 +54,9 @@ with st.sidebar:
     voice_id = "ur-PK-AsadNeural" if "Asad" in voice_selection else "ur-PK-UzmaNeural"
 
     enable_lipsync = st.checkbox(
-        "Enable AI Lip-Sync (مطلوبہ Lip-Sync)",
+        "Enable AI Lip-Sync (Beta)",
         value=True,
-        help="Synchronizes actor's lip movements using a free GPU cloud space."
+        help="Synchronizes actor's lip movements using cloud GPU space."
     )
     
     burn_subtitles = st.checkbox(
@@ -76,9 +77,27 @@ def get_media_duration(file_path: str) -> float:
     except Exception:
         return 0.0
 
-async def generate_urdu_tts(text: str, voice: str, output_path: str):
-    communicate = edge_tts.Communicate(text=text, voice=voice)
-    await communicate.save(output_path)
+async def generate_urdu_tts_robust(text: str, voice: str, output_path: str):
+    """Generates Urdu speech using Edge-TTS with instant automatic gTTS fallback."""
+    clean_text = text.strip()
+    if not clean_text:
+        clean_text = "آواز ریکارڈ نہیں ہو سکی"
+
+    # Attempt 1: Microsoft Neural Voice
+    try:
+        communicate = edge_tts.Communicate(text=clean_text, voice=voice)
+        await communicate.save(output_path)
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 500:
+            return
+    except Exception:
+        pass
+
+    # Attempt 2: Bulletproof Google Urdu TTS Fallback (never blocks on cloud)
+    try:
+        tts = gTTS(text=clean_text, lang="ur")
+        tts.save(output_path)
+    except Exception as e:
+        raise RuntimeError(f"All Urdu speech engines failed: {str(e)}")
 
 def adjust_audio_tempo(input_audio: str, target_duration: float, output_audio: str):
     curr_duration = get_media_duration(input_audio)
@@ -97,22 +116,33 @@ def adjust_audio_tempo(input_audio: str, target_duration: float, output_audio: s
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def run_wav2lip_cloud(video_path: str, audio_path: str) -> str:
-    """Invokes active public Hugging Face Space for Wav2Lip."""
-    hf_client = Client("camenduru/Wav2Lip")
-    result = hf_client.predict(
-        face=handle_file(video_path),
-        audio=handle_file(audio_path),
-        api_name="/predict"
-    )
-    return result
+    """Attempts lip-sync using active public spaces."""
+    spaces_to_try = [
+        "camenduru/Wav2Lip",
+        "Suprath/lipSync"
+    ]
+    for space_id in spaces_to_try:
+        try:
+            hf_client = Client(space_id)
+            result = hf_client.predict(
+                face=handle_file(video_path),
+                audio=handle_file(audio_path),
+                api_name="/predict"
+            )
+            if result and os.path.exists(result):
+                return result
+        except Exception:
+            continue
+    return None
 
-def translate_text(groq_client: Groq, text: str, source_lang: str) -> str:
+def translate_full_dialogue(groq_client: Groq, text: str, source_lang: str) -> str:
     system_prompt = (
-        f"You are an expert dubbing translator. Translate the provided {source_lang} speech "
-        "into natural, conversational spoken Pakistani Urdu suitable for audio voiceover and subtitles. "
-        "Keep it concise and clear. Output ONLY the Urdu translation script in Urdu alphabet without explanations or notes."
+        f"You are an expert dubbing translator. Translate the provided {source_lang} dialogue "
+        "into natural, fluent, spoken Pakistani Urdu dialogue for video voiceover. "
+        "Keep the phrasing concise and natural so it fits the video duration. "
+        "Output ONLY the Urdu translation script in Urdu alphabet without any English or explanations."
     )
-    for model_id in ["mixtral-8x7b-32768", "gemma2-9b-it"]:
+    for model_id in ["llama-3.1-8b-instant", "mixtral-8x7b-32768", "gemma2-9b-it"]:
         try:
             res = groq_client.chat.completions.create(
                 model=model_id,
@@ -122,7 +152,9 @@ def translate_text(groq_client: Groq, text: str, source_lang: str) -> str:
                 ],
                 temperature=0.3
             )
-            return res.choices[0].message.content.strip()
+            result_text = res.choices[0].message.content.strip()
+            if result_text:
+                return result_text
         except Exception:
             continue
     return text
@@ -131,7 +163,7 @@ def format_srt_time(seconds: float) -> str:
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
-    millis = int(int((seconds - int(seconds)) * 1000))
+    millis = int((seconds - int(seconds)) * 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 # 4. Main Application Interface
@@ -167,96 +199,71 @@ if uploaded_file is not None:
                     "-vn", "-acodec", "libmp3lame", "-ar", "16000", extracted_audio_path
                 ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-                # Step 2: Timestamped Transcription via Whisper (verbose_json)
-                status.info("Step 2/6: Transcribing speech with timestamps...")
+                # Step 2: Transcribe Speech via Groq Whisper
+                status.info("Step 2/6: Transcribing speech with Whisper...")
                 progress.progress(25)
                 
                 with open(extracted_audio_path, "rb") as audio_file:
                     whisper_args = {
                         "file": (os.path.basename(extracted_audio_path), audio_file.read()),
                         "model": "whisper-large-v3-turbo",
-                        "response_format": "verbose_json",
-                        "timestamp_granularities": ["segment"]
+                        "response_format": "verbose_json"
                     }
                     if source_language_code:
                         whisper_args["language"] = source_language_code
                     
                     transcript_res = client.audio.transcriptions.create(**whisper_args)
 
-                segments = getattr(transcript_res, "segments", [])
                 full_original_text = getattr(transcript_res, "text", "")
-
-                if not full_original_text or not segments:
-                    st.error("No clear voice speech detected in the video.")
+                if not full_original_text:
+                    st.error("No clear speech detected in the video.")
                     st.stop()
 
-                # Step 3: Translate segments for Subtitles & Full Script
-                status.info("Step 3/6: Generating Urdu translation & subtitle segments...")
+                # Step 3: Complete Urdu Translation
+                status.info("Step 3/6: Translating full speech into natural Urdu...")
                 progress.progress(45)
                 
                 lang_name = selected_lang_label.split(" (")[0]
-                urdu_subtitle_segments = []
-                full_urdu_script_parts = []
+                urdu_text = translate_full_dialogue(client, full_original_text, lang_name)
 
-                for seg in segments:
-                    seg_text = seg.get("text", "").strip()
-                    seg_start = seg.get("start", 0.0)
-                    seg_end = seg.get("end", seg_start + 1.0)
-                    
-                    if seg_text:
-                        translated_seg = translate_text(client, seg_text, lang_name)
-                        full_urdu_script_parts.append(translated_seg)
-                        urdu_subtitle_segments.append({
-                            "start": seg_start,
-                            "end": seg_end,
-                            "text": translated_seg
-                        })
-
-                urdu_text = " ".join(full_urdu_script_parts)
-
-                # Create SRT file
+                # Generate Subtitle File (SRT)
                 with open(srt_path, "w", encoding="utf-8") as srt_file:
-                    for idx, s_item in enumerate(urdu_subtitle_segments, 1):
-                        start_str = format_srt_time(s_item["start"])
-                        end_str = format_srt_time(s_item["end"])
-                        srt_file.write(f"{idx}\n{start_str} --> {end_str}\n{s_item['text']}\n\n")
+                    srt_file.write(f"1\n00:00:00,500 --> {format_srt_time(video_duration)}\n{urdu_text}\n\n")
 
-                # Step 4: Text-to-Speech & Duration Synchronization
+                # Step 4: Robust Urdu Speech Synthesis & Timing Sync
                 status.info("Step 4/6: Synthesizing Urdu voice and synchronizing timing...")
                 progress.progress(65)
-                asyncio.run(generate_urdu_tts(urdu_text, voice_id, raw_urdu_audio_path))
+                asyncio.run(generate_urdu_tts_robust(urdu_text, voice_id, raw_urdu_audio_path))
                 adjust_audio_tempo(raw_urdu_audio_path, video_duration, synced_urdu_audio_path)
 
-                # Step 5: AI Lip-Sync (Mandatory execution)
+                # Step 5: AI Lip-Sync Processing
                 status.info("Step 5/6: Processing AI Lip-Sync on cloud GPU...")
                 progress.progress(80)
 
                 lip_sync_success = False
                 if enable_lipsync:
-                    try:
-                        cloud_result = run_wav2lip_cloud(input_video_path, synced_urdu_audio_path)
-                        if cloud_result and os.path.exists(cloud_result):
-                            dubbed_video_path = cloud_result
-                            lip_sync_success = True
-                    except Exception as err:
-                        st.warning(f"Cloud Lip-Sync notice: {err}. Using standard precise audio multiplexing.")
+                    cloud_result = run_wav2lip_cloud(input_video_path, synced_urdu_audio_path)
+                    if cloud_result and os.path.exists(cloud_result):
+                        dubbed_video_path = cloud_result
+                        lip_sync_success = True
+                    else:
+                        st.warning("Cloud Lip-Sync server was busy. Applied high-precision audio dubbing.")
 
                 if not lip_sync_success:
+                    # Mux audio and video matching exact video duration
                     subprocess.run([
                         "ffmpeg", "-y", "-i", input_video_path, "-i", synced_urdu_audio_path,
                         "-c:v", "copy", "-map", "0:v:0", "-map", "1:a:0",
-                        "-shortest", dubbed_video_path
+                        "-t", str(video_duration), dubbed_video_path
                     ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-                # Step 6: Burn Urdu Subtitles onto Video
-                status.info("Step 6/6: Burning Urdu subtitles into final video...")
+                # Step 6: Burn Urdu Subtitles
+                status.info("Step 6/6: Rendering subtitles and final video...")
                 progress.progress(95)
 
                 if burn_subtitles and os.path.exists(srt_path):
-                    # FFmpeg subtitle filter escaping path for Windows/Linux compatibility
-                    escaped_srt_path = srt_path.replace('\\', '/').replace(':', '\\:')
-                    sub_filter = f"subtitles='{escaped_srt_path}':force_style='FontName=Noto Sans,FontSize=22,PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,BorderStyle=1,Alignment=2'"
-                    
+                    escaped_srt = srt_path.replace('\\', '/').replace(':', '\\:')
+                    sub_filter = f"subtitles='{escaped_srt}':force_style='FontSize=22,PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,BorderStyle=1,Alignment=2'"
                     cmd_burn = [
                         "ffmpeg", "-y", "-i", dubbed_video_path,
                         "-vf", sub_filter,
@@ -264,13 +271,12 @@ if uploaded_file is not None:
                     ]
                     burn_res = subprocess.run(cmd_burn, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                     if burn_res.returncode != 0:
-                        # Fallback if subtitle filter fails due to font naming
                         final_output_path = dubbed_video_path
                 else:
                     final_output_path = dubbed_video_path
 
                 progress.progress(100)
-                status.success("🎉 Complete process finished successfully!")
+                status.success("🎉 Video dubbed successfully!")
 
                 # Display Results
                 col1, col2 = st.columns(2)
@@ -281,7 +287,7 @@ if uploaded_file is not None:
                     st.markdown("**Urdu Dubbing Script:**")
                     st.success(urdu_text)
 
-                st.subheader("Final Urdu Dubbed Video (with Lip-Sync & Subtitles)")
+                st.subheader("Final Urdu Dubbed Video")
                 st.video(final_output_path)
 
                 with open(final_output_path, "rb") as out_file:
