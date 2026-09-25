@@ -6,18 +6,17 @@ import streamlit as st
 from groq import Groq
 import edge_tts
 from gtts import gTTS
-from gradio_client import Client, handle_file
 
 st.set_page_config(
-    page_title="AI Video to Urdu Dubber, Lip-Sync & Subtitles",
+    page_title="AI Video to Urdu Dubber Studio",
     page_icon="🎬",
     layout="wide"
 )
 
-st.title("🎬 AI Urdu Dubbing Studio with Lip-Sync & Subtitles")
-st.caption("Convert multilingual videos into synchronized Urdu speech with AI Lip-Sync and burned-in Urdu Subtitles")
+st.title("🎬 AI Video to Urdu Dubber Studio (Auto-Language & Full Audio)")
+st.caption("Convert Arabic, Turkish, Persian, or English videos into complete synchronized Urdu speech")
 
-# 1. API Key Configuration
+# 1. API Key Setup
 api_key = st.secrets.get("GROQ_API_KEY", "")
 if not api_key:
     api_key = st.sidebar.text_input("Enter Groq API Key", type="password")
@@ -33,36 +32,30 @@ with st.sidebar:
     st.header("⚙️ Configuration")
     
     language_mapping = {
-        "Auto-Detect (خودکار شناخت)": None,
-        "English (انگریزی)": "en",
+        "Auto-Detect (خودکار شناخت - بہترین)": None,
         "Arabic (عربی)": "ar",
         "Turkish (ترکی)": "tr",
-        "Persian / Farsi (فارسی)": "fa"
+        "Persian / Farsi (فارسی)": "fa",
+        "English (انگریزی)": "en"
     }
     selected_lang_label = st.selectbox(
-        "Select Video Language (ویڈیو کی زبان)",
+        "Video Language (ویڈیو کی زبان)",
         options=list(language_mapping.keys()),
-        index=0
+        index=0  # Defaults to Auto-Detect
     )
     source_language_code = language_mapping[selected_lang_label]
 
     voice_selection = st.selectbox(
         "Select Urdu Voice (اردو آواز)",
-        options=["Asad (Male - Pakistani)", "Uzma (Female - Pakistani)"],
+        options=["Asad (Male - پاکستانی مرد)", "Uzma (Female - پاکستانی خاتون)"],
         index=0
     )
     voice_id = "ur-PK-AsadNeural" if "Asad" in voice_selection else "ur-PK-UzmaNeural"
 
-    enable_lipsync = st.checkbox(
-        "Enable AI Lip-Sync (Beta)",
-        value=True,
-        help="Synchronizes actor's lip movements using cloud GPU space."
-    )
-    
     burn_subtitles = st.checkbox(
         "Burn Urdu Subtitles (اردو سب ٹائٹلز دکھائیں)",
         value=True,
-        help="Embeds time-synced Urdu subtitles at the bottom of the video."
+        help="Embeds subtitles at the bottom of the video."
     )
 
 # 3. Helper Functions
@@ -77,8 +70,25 @@ def get_media_duration(file_path: str) -> float:
     except Exception:
         return 0.0
 
+def get_best_groq_chat_model(groq_client: Groq) -> str:
+    """Dynamically detects active chat models on user's Groq account."""
+    try:
+        models = groq_client.models.list().data
+        valid_models = [
+            m.id for m in models 
+            if not any(x in m.id for x in ["whisper", "guard", "vision", "embed"])
+        ]
+        # Prefer powerful models first
+        for preferred in ["llama-3.3-70b-versatile", "llama3-70b-8192", "llama3-8b-8192", "gemma2-9b-it"]:
+            if preferred in valid_models:
+                return preferred
+        if valid_models:
+            return valid_models[0]
+    except Exception:
+        pass
+    return "llama3-8b-8192"
+
 async def generate_urdu_tts_robust(text: str, voice: str, output_path: str):
-    """Generates Urdu speech using Edge-TTS with instant automatic gTTS fallback."""
     clean_text = text.strip()
     if not clean_text:
         clean_text = "آواز ریکارڈ نہیں ہو سکی"
@@ -87,17 +97,17 @@ async def generate_urdu_tts_robust(text: str, voice: str, output_path: str):
     try:
         communicate = edge_tts.Communicate(text=clean_text, voice=voice)
         await communicate.save(output_path)
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 500:
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
             return
     except Exception:
         pass
 
-    # Attempt 2: Bulletproof Google Urdu TTS Fallback (never blocks on cloud)
+    # Attempt 2: Google Urdu TTS Fallback
     try:
         tts = gTTS(text=clean_text, lang="ur")
         tts.save(output_path)
     except Exception as e:
-        raise RuntimeError(f"All Urdu speech engines failed: {str(e)}")
+        raise RuntimeError(f"Urdu speech synthesis failed: {str(e)}")
 
 def adjust_audio_tempo(input_audio: str, target_duration: float, output_audio: str):
     curr_duration = get_media_duration(input_audio)
@@ -106,7 +116,7 @@ def adjust_audio_tempo(input_audio: str, target_duration: float, output_audio: s
         return
 
     tempo = curr_duration / target_duration
-    tempo = max(0.70, min(1.40, tempo))
+    tempo = max(0.70, min(1.45, tempo))
     
     cmd = [
         "ffmpeg", "-y", "-i", input_audio,
@@ -115,49 +125,27 @@ def adjust_audio_tempo(input_audio: str, target_duration: float, output_audio: s
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-def run_wav2lip_cloud(video_path: str, audio_path: str) -> str:
-    """Attempts lip-sync using active public spaces."""
-    spaces_to_try = [
-        "camenduru/Wav2Lip",
-        "Suprath/lipSync"
-    ]
-    for space_id in spaces_to_try:
-        try:
-            hf_client = Client(space_id)
-            result = hf_client.predict(
-                face=handle_file(video_path),
-                audio=handle_file(audio_path),
-                api_name="/predict"
-            )
-            if result and os.path.exists(result):
-                return result
-        except Exception:
-            continue
-    return None
-
-def translate_full_dialogue(groq_client: Groq, text: str, source_lang: str) -> str:
+def translate_to_urdu(groq_client: Groq, text: str) -> str:
+    active_model = get_best_groq_chat_model(groq_client)
     system_prompt = (
-        f"You are an expert dubbing translator. Translate the provided {source_lang} dialogue "
-        "into natural, fluent, spoken Pakistani Urdu dialogue for video voiceover. "
-        "Keep the phrasing concise and natural so it fits the video duration. "
-        "Output ONLY the Urdu translation script in Urdu alphabet without any English or explanations."
+        "You are an expert dubbing translator. Translate the given spoken speech (which could be Arabic, Turkish, or Persian) "
+        "into clear, natural, spoken Pakistani Urdu dialogue for voiceover dubbing.\n"
+        "STRICT INSTRUCTIONS:\n"
+        "1. Translate the entire meaning accurately into Urdu.\n"
+        "2. Do NOT summarize or omit content.\n"
+        "3. Output ONLY the Urdu translation script in Urdu alphabet. Do not write any English, notes, or explanations."
     )
-    for model_id in ["llama-3.1-8b-instant", "mixtral-8x7b-32768", "gemma2-9b-it"]:
-        try:
-            res = groq_client.chat.completions.create(
-                model=model_id,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": text}
-                ],
-                temperature=0.3
-            )
-            result_text = res.choices[0].message.content.strip()
-            if result_text:
-                return result_text
-        except Exception:
-            continue
-    return text
+    
+    res = groq_client.chat.completions.create(
+        model=active_model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text}
+        ],
+        max_tokens=4096,
+        temperature=0.2
+    )
+    return res.choices[0].message.content.strip()
 
 def format_srt_time(seconds: float) -> str:
     hours = int(seconds // 3600)
@@ -172,7 +160,7 @@ uploaded_file = st.file_uploader("Upload Video File (MP4, MKV, MOV)", type=["mp4
 if uploaded_file is not None:
     st.video(uploaded_file)
     
-    if st.button("🚀 Start Full Dubbing, Lip-Sync & Subtitle Pipeline", type="primary"):
+    if st.button("🚀 Start Full Urdu Dubbing Pipeline", type="primary"):
         with tempfile.TemporaryDirectory() as temp_dir:
             input_video_path = os.path.join(temp_dir, "input.mp4")
             extracted_audio_path = os.path.join(temp_dir, "extracted.mp3")
@@ -192,78 +180,70 @@ if uploaded_file is not None:
 
             try:
                 # Step 1: Extract Audio
-                status.info("Step 1/6: Extracting audio from video...")
-                progress.progress(10)
+                status.info("Step 1/5: Extracting audio from original video...")
+                progress.progress(20)
                 subprocess.run([
                     "ffmpeg", "-y", "-i", input_video_path,
                     "-vn", "-acodec", "libmp3lame", "-ar", "16000", extracted_audio_path
                 ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-                # Step 2: Transcribe Speech via Groq Whisper
-                status.info("Step 2/6: Transcribing speech with Whisper...")
-                progress.progress(25)
+                # Step 2: Speech-to-Text via Whisper
+                status.info("Step 2/5: Transcribing full speech (Auto-Detecting Language)...")
+                progress.progress(40)
                 
                 with open(extracted_audio_path, "rb") as audio_file:
                     whisper_args = {
                         "file": (os.path.basename(extracted_audio_path), audio_file.read()),
-                        "model": "whisper-large-v3-turbo",
-                        "response_format": "verbose_json"
+                        "model": "whisper-large-v3",
+                        "response_format": "text"
                     }
                     if source_language_code:
                         whisper_args["language"] = source_language_code
-                    
-                    transcript_res = client.audio.transcriptions.create(**whisper_args)
 
-                full_original_text = getattr(transcript_res, "text", "")
-                if not full_original_text:
-                    st.error("No clear speech detected in the video.")
+                    transcription = client.audio.transcriptions.create(**whisper_args)
+
+                original_speech_text = str(transcription).strip()
+                if not original_speech_text:
+                    st.error("No audible voice speech was found in the video.")
                     st.stop()
 
                 # Step 3: Complete Urdu Translation
-                status.info("Step 3/6: Translating full speech into natural Urdu...")
-                progress.progress(45)
-                
-                lang_name = selected_lang_label.split(" (")[0]
-                urdu_text = translate_full_dialogue(client, full_original_text, lang_name)
+                status.info("Step 3/5: Translating complete speech into Urdu...")
+                progress.progress(60)
+                urdu_text = translate_to_urdu(client, original_speech_text)
 
-                # Generate Subtitle File (SRT)
+                # Prepare Subtitle File
                 with open(srt_path, "w", encoding="utf-8") as srt_file:
                     srt_file.write(f"1\n00:00:00,500 --> {format_srt_time(video_duration)}\n{urdu_text}\n\n")
 
-                # Step 4: Robust Urdu Speech Synthesis & Timing Sync
-                status.info("Step 4/6: Synthesizing Urdu voice and synchronizing timing...")
-                progress.progress(65)
+                # Step 4: Synthesize Urdu Voice and Match Duration
+                status.info("Step 4/5: Synthesizing full Urdu voice and matching timing...")
+                progress.progress(80)
                 asyncio.run(generate_urdu_tts_robust(urdu_text, voice_id, raw_urdu_audio_path))
                 adjust_audio_tempo(raw_urdu_audio_path, video_duration, synced_urdu_audio_path)
 
-                # Step 5: AI Lip-Sync Processing
-                status.info("Step 5/6: Processing AI Lip-Sync on cloud GPU...")
-                progress.progress(80)
+                # Step 5: Merge Audio with Video (Exact Duration Lock)
+                status.info("Step 5/5: Multiplexing audio and rendering final video...")
+                progress.progress(90)
 
-                lip_sync_success = False
-                if enable_lipsync:
-                    cloud_result = run_wav2lip_cloud(input_video_path, synced_urdu_audio_path)
-                    if cloud_result and os.path.exists(cloud_result):
-                        dubbed_video_path = cloud_result
-                        lip_sync_success = True
-                    else:
-                        st.warning("Cloud Lip-Sync server was busy. Applied high-precision audio dubbing.")
+                cmd_merge = [
+                    "ffmpeg", "-y",
+                    "-i", input_video_path,
+                    "-i", synced_urdu_audio_path,
+                    "-c:v", "copy",
+                    "-c:a", "aac",
+                    "-filter_complex", f"[1:a]apad=whole_dur={video_duration}[a]",
+                    "-map", "0:v:0",
+                    "-map", "[a]",
+                    "-t", str(video_duration),
+                    dubbed_video_path
+                ]
+                subprocess.run(cmd_merge, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-                if not lip_sync_success:
-                    # Mux audio and video matching exact video duration
-                    subprocess.run([
-                        "ffmpeg", "-y", "-i", input_video_path, "-i", synced_urdu_audio_path,
-                        "-c:v", "copy", "-map", "0:v:0", "-map", "1:a:0",
-                        "-t", str(video_duration), dubbed_video_path
-                    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-                # Step 6: Burn Urdu Subtitles
-                status.info("Step 6/6: Rendering subtitles and final video...")
-                progress.progress(95)
-
+                # Subtitle Burn-in
                 if burn_subtitles and os.path.exists(srt_path):
                     escaped_srt = srt_path.replace('\\', '/').replace(':', '\\:')
-                    sub_filter = f"subtitles='{escaped_srt}':force_style='FontSize=22,PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,BorderStyle=1,Alignment=2'"
+                    sub_filter = f"subtitles='{escaped_srt}':force_style='FontSize=20,PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,BorderStyle=1,Alignment=2'"
                     cmd_burn = [
                         "ffmpeg", "-y", "-i", dubbed_video_path,
                         "-vf", sub_filter,
@@ -276,25 +256,27 @@ if uploaded_file is not None:
                     final_output_path = dubbed_video_path
 
                 progress.progress(100)
-                status.success("🎉 Video dubbed successfully!")
+                status.success("🎉 Processing complete! Full video dubbed into Urdu.")
 
                 # Display Results
+                st.subheader("📋 Transcripts Verification")
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.markdown("**Original Transcript:**")
-                    st.info(full_original_text)
+                    st.markdown("**Detected Original Speech:**")
+                    st.text_area("Original Transcript", value=original_speech_text, height=200)
                 with col2:
-                    st.markdown("**Urdu Dubbing Script:**")
-                    st.success(urdu_text)
+                    st.markdown("**Complete Urdu Translation:**")
+                    st.text_area("Urdu Dubbing Script", value=urdu_text, height=200)
 
-                st.subheader("Final Urdu Dubbed Video")
+                # Final Video
+                st.subheader("🎬 Final Urdu Dubbed Video")
                 st.video(final_output_path)
 
                 with open(final_output_path, "rb") as out_file:
                     st.download_button(
-                        label="⬇️ Download Final Dubbed Video",
+                        label="⬇️ Download Full Dubbed Video",
                         data=out_file.read(),
-                        file_name="urdu_dubbed_final.mp4",
+                        file_name="urdu_dubbed_video.mp4",
                         mime="video/mp4",
                         type="primary"
                     )
